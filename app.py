@@ -1,103 +1,122 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import os
 from supabase import create_client, Client
 import plotly.express as px
-from io import BytesIO
+import plotly.graph_objects as go
 from fpdf import FPDF
 import base64
+import traceback
 
 # -------------------- Supabase Initialization --------------------
-SUPABASE_URL = st.secrets["SUPABASE_URL"]
-SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+@st.cache_resource
+def init_supabase():
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    return create_client(url, key)
+
+supabase = init_supabase()
 
 # -------------------- Session State Initialization --------------------
-if 'authenticated' not in st.session_state:
-    st.session_state.authenticated = False
-if 'current_shift_id' not in st.session_state:
-    st.session_state.current_shift_id = None
-if 'current_shift_name' not in st.session_state:
-    st.session_state.current_shift_name = None
-if 'current_date' not in st.session_state:
-    st.session_state.current_date = date.today()
+def init_session():
+    defaults = {
+        'authenticated': False,
+        'current_shift_id': None,
+        'current_shift_name': None,
+        'current_date': date.today(),
+        'page': 'Dashboard',
+        'expense_rows': [],
+        'payment_rows': [],
+        'purchase_rows': [],
+        'return_rows': [],
+        'withdrawal_rows': []
+    }
+    for key, val in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
 
-# -------------------- Authentication (simple) --------------------
+init_session()
+
+# -------------------- Authentication --------------------
 def login():
     st.title("🔐 Medical Store Login")
-    password = st.text_input("Enter Password", type="password")
-    if st.button("Login"):
-        # Use environment variable or hardcoded password
-        if password == st.secrets.get("APP_PASSWORD", "admin123"):
-            st.session_state.authenticated = True
-            st.rerun()
-        else:
-            st.error("Incorrect password")
+    with st.form("login_form"):
+        password = st.text_input("Password", type="password")
+        if st.form_submit_button("Login"):
+            if password == st.secrets.get("APP_PASSWORD", "admin123"):
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("Incorrect password")
 
 if not st.session_state.authenticated:
     login()
     st.stop()
 
 # -------------------- Helper Functions --------------------
+def safe_supabase_call(func, *args, **kwargs):
+    try:
+        return func(*args, **kwargs)
+    except Exception as e:
+        st.error(f"Database error: {str(e)}")
+        st.stop()
+
 def fetch_expense_heads():
-    response = supabase.table("expense_heads").select("*").execute()
-    return pd.DataFrame(response.data)
+    return pd.DataFrame(supabase.table("expense_heads").select("*").execute().data)
 
 def fetch_vendors():
-    response = supabase.table("vendors").select("*").execute()
-    return pd.DataFrame(response.data)
+    return pd.DataFrame(supabase.table("vendors").select("*").execute().data)
 
 def fetch_shifts(date_selected):
-    response = supabase.table("shifts").select("*").eq("date", date_selected).execute()
+    response = supabase.table("shifts").select("*").eq("date", date_selected.isoformat()).execute()
     return pd.DataFrame(response.data)
 
 def get_or_create_shift(date_selected, shift_name):
     # Check if shift exists
-    response = supabase.table("shifts").select("*").eq("date", date_selected).eq("shift_name", shift_name).execute()
+    response = supabase.table("shifts").select("*").eq("date", date_selected.isoformat()).eq("shift_name", shift_name).execute()
     if response.data:
         return response.data[0]['id']
-    else:
-        # Determine opening cash: closing of previous shift or 0
-        prev_shifts = supabase.table("shifts").select("*").eq("date", date_selected).lt("shift_name", shift_name).order("shift_name").execute()
-        opening = 0
-        if prev_shifts.data:
-            last_shift = prev_shifts.data[-1]
-            opening = last_shift.get('expected_cash') or last_shift.get('closing_cash_entered') or 0
-        # Create shift
-        data = {
-            "date": date_selected.isoformat(),
-            "shift_name": shift_name,
-            "opening_cash": opening,
-            "total_sale": 0,
-            "status": "open"
-        }
-        response = supabase.table("shifts").insert(data).execute()
-        return response.data[0]['id']
+    
+    # Determine opening cash
+    prev_shifts = supabase.table("shifts").select("*").eq("date", date_selected.isoformat()).lt("shift_name", shift_name).order("shift_name").execute()
+    opening = 0
+    if prev_shifts.data:
+        last_shift = prev_shifts.data[-1]
+        opening = last_shift.get('expected_cash') or last_shift.get('closing_cash_entered') or 0
+    
+    data = {
+        "date": date_selected.isoformat(),
+        "shift_name": shift_name,
+        "opening_cash": opening,
+        "total_sale": 0,
+        "status": "open"
+    }
+    response = supabase.table("shifts").insert(data).execute()
+    return response.data[0]['id']
 
 def calculate_expected_cash(shift_id):
-    # Get shift details
     shift = supabase.table("shifts").select("*").eq("id", shift_id).execute().data[0]
     opening = shift['opening_cash'] or 0
     sale = shift['total_sale'] or 0
     
     # Expenses from sales cash
-    expenses_sales = supabase.table("expenses").select("amount").eq("shift_id", shift_id).eq("source", "sales_cash").execute()
-    total_expenses_sales = sum([e['amount'] for e in expenses_sales.data])
+    exp_sales = supabase.table("expenses").select("amount").eq("shift_id", shift_id).eq("source", "sales_cash").execute()
+    total_exp_sales = sum([e['amount'] for e in exp_sales.data])
     
     # Vendor payments from sales cash
-    payments_sales = supabase.table("vendor_payments").select("amount").eq("shift_id", shift_id).eq("source", "sales_cash").execute()
-    total_payments_sales = sum([p['amount'] for p in payments_sales.data])
+    pay_sales = supabase.table("vendor_payments").select("amount").eq("shift_id", shift_id).eq("source", "sales_cash").execute()
+    total_pay_sales = sum([p['amount'] for p in pay_sales.data])
     
     # Purchases cash from sales cash
-    purchases_sales = supabase.table("purchases").select("amount").eq("shift_id", shift_id).eq("payment_type", "cash").eq("source_if_cash", "sales_cash").execute()
-    total_purchases_sales = sum([p['amount'] for p in purchases_sales.data])
+    pur_sales = supabase.table("purchases").select("amount").eq("shift_id", shift_id).eq("payment_type", "cash").eq("source_if_cash", "sales_cash").execute()
+    total_pur_sales = sum([p['amount'] for p in pur_sales.data])
     
     # Withdrawals
-    withdrawals = supabase.table("withdrawals").select("amount").eq("shift_id", shift_id).execute()
-    total_withdrawals = sum([w['amount'] for w in withdrawals.data])
+    wd = supabase.table("withdrawals").select("amount").eq("shift_id", shift_id).execute()
+    total_wd = sum([w['amount'] for w in wd.data])
     
-    expected = opening + sale - (total_expenses_sales + total_payments_sales + total_purchases_sales + total_withdrawals)
+    expected = opening + sale - (total_exp_sales + total_pay_sales + total_pur_sales + total_wd)
     return expected
 
 def update_expected_cash(shift_id):
@@ -107,55 +126,69 @@ def update_expected_cash(shift_id):
 def close_shift(shift_id, closing_cash):
     shift = supabase.table("shifts").select("*").eq("id", shift_id).execute().data[0]
     expected = shift['expected_cash'] or calculate_expected_cash(shift_id)
+    
     if closing_cash < expected:
-        # Create shortage expense
         shortage_head = supabase.table("expense_heads").select("id").eq("name", "Cash Shortage").execute().data[0]['id']
-        shortage_amount = expected - closing_cash
+        shortage_amt = expected - closing_cash
         supabase.table("expenses").insert({
             "shift_id": shift_id,
             "expense_head_id": shortage_head,
-            "amount": shortage_amount,
+            "amount": shortage_amt,
             "source": "sales_cash",
             "description": "Auto-recorded cash shortage"
         }).execute()
-        # Update expected after adding shortage
         update_expected_cash(shift_id)
-    # Close shift
+    
     supabase.table("shifts").update({
         "closing_cash_entered": closing_cash,
         "status": "closed",
         "closed_at": datetime.now().isoformat()
     }).eq("id", shift_id).execute()
 
-# -------------------- Page Layout --------------------
-st.set_page_config(page_title="Medical Store 3-Shift Accounting", layout="wide")
+def record_owner_ledger(amount, description, shift_id=None):
+    """amount positive = owner puts in, negative = owner withdraws"""
+    supabase.table("owner_ledger").insert({
+        "transaction_date": datetime.now().isoformat(),
+        "amount": amount,
+        "description": description,
+        "shift_id": shift_id
+    }).execute()
 
-tabs = st.tabs(["📊 Dashboard", "⚙️ Heads Setup", "📝 Shift Recording", "📈 Reports"])
+# -------------------- Navigation --------------------
+st.sidebar.title("Medical Store")
+pages = ["Dashboard", "Heads Setup", "Shift Recording", "Reports"]
+choice = st.sidebar.radio("Go to", pages, index=pages.index(st.session_state.page))
+st.session_state.page = choice
 
-# -------------------- Dashboard Tab --------------------
-with tabs[0]:
-    st.header("Dashboard")
+# -------------------- Dashboard Page --------------------
+if st.session_state.page == "Dashboard":
+    st.title("📊 Dashboard")
+    
     col1, col2 = st.columns([1, 3])
     with col1:
         selected_date = st.date_input("Select Date", value=date.today())
     with col2:
         st.subheader(f"Summary for {selected_date}")
     
-    # Fetch all shifts for that date
     shifts = fetch_shifts(selected_date)
     if shifts.empty:
         st.info("No shifts recorded for this date.")
     else:
-        # Aggregate data across shifts
+        # KPI cards
         total_sale = shifts['total_sale'].sum()
-        total_expenses = supabase.table("expenses").select("amount").in_("shift_id", shifts['id'].tolist()).execute()
-        total_expenses = sum([e['amount'] for e in total_expenses.data]) if total_expenses.data else 0
-        total_withdrawals = supabase.table("withdrawals").select("amount").in_("shift_id", shifts['id'].tolist()).execute()
-        total_withdrawals = sum([w['amount'] for w in total_withdrawals.data]) if total_withdrawals.data else 0
-        total_payments = supabase.table("vendor_payments").select("amount").in_("shift_id", shifts['id'].tolist()).execute()
-        total_payments = sum([p['amount'] for p in total_payments.data]) if total_payments.data else 0
+        shift_ids = shifts['id'].tolist()
         
-        # Overall cash available: sum of closing cash of last shift? Or just expected of last shift?
+        # Fetch totals
+        expenses = supabase.table("expenses").select("amount").in_("shift_id", shift_ids).execute()
+        total_expenses = sum([e['amount'] for e in expenses.data]) if expenses.data else 0
+        
+        withdrawals = supabase.table("withdrawals").select("amount").in_("shift_id", shift_ids).execute()
+        total_withdrawals = sum([w['amount'] for w in withdrawals.data]) if withdrawals.data else 0
+        
+        payments = supabase.table("vendor_payments").select("amount").in_("shift_id", shift_ids).execute()
+        total_payments = sum([p['amount'] for p in payments.data]) if payments.data else 0
+        
+        # Available cash (closing of last shift)
         last_shift = shifts.iloc[-1]
         available_cash = last_shift['expected_cash'] if pd.notna(last_shift['expected_cash']) else 0
         
@@ -166,7 +199,7 @@ with tabs[0]:
         cold.metric("Vendor Payments", f"₹{total_payments:,.2f}")
         cole.metric("Available Cash", f"₹{available_cash:,.2f}")
         
-        # Show shifts breakdown
+        # Shift breakdown
         st.subheader("Shifts Breakdown")
         for _, shift in shifts.iterrows():
             with st.expander(f"{shift['shift_name']} Shift - {'Closed' if shift['status']=='closed' else 'Open'}"):
@@ -176,63 +209,67 @@ with tabs[0]:
                 if pd.notna(shift['closing_cash_entered']):
                     st.write(f"Closing Cash Entered: ₹{shift['closing_cash_entered']:,.2f}")
 
-# -------------------- Heads Setup Tab --------------------
-with tabs[1]:
-    st.header("Expense Heads & Vendors")
+# -------------------- Heads Setup Page --------------------
+elif st.session_state.page == "Heads Setup":
+    st.title("⚙️ Heads & Vendors")
     
     tab1, tab2 = st.tabs(["Expense Heads", "Vendors"])
     
     with tab1:
-        st.subheader("Manage Expense Heads")
-        with st.form("add_expense_head"):
+        st.subheader("Expense Heads")
+        with st.form("add_head"):
             name = st.text_input("Head Name")
-            description = st.text_area("Description (optional)")
+            desc = st.text_area("Description")
             if st.form_submit_button("Add Head"):
                 if name:
-                    supabase.table("expense_heads").insert({"name": name, "description": description}).execute()
+                    supabase.table("expense_heads").insert({"name": name, "description": desc}).execute()
                     st.success("Added!")
                     st.rerun()
-        # Show existing
         heads = fetch_expense_heads()
-        st.dataframe(heads[['name', 'description']])
+        st.dataframe(heads[['name', 'description']], use_container_width=True)
     
     with tab2:
-        st.subheader("Manage Vendors")
+        st.subheader("Vendors")
         with st.form("add_vendor"):
             name = st.text_input("Vendor Name")
-            contact = st.text_input("Contact (optional)")
-            opening_balance = st.number_input("Opening Balance", value=0.0)
+            contact = st.text_input("Contact")
+            opening = st.number_input("Opening Balance", value=0.0)
             if st.form_submit_button("Add Vendor"):
                 if name:
-                    supabase.table("vendors").insert({"name": name, "contact": contact, "opening_balance": opening_balance}).execute()
+                    supabase.table("vendors").insert({
+                        "name": name, 
+                        "contact": contact, 
+                        "opening_balance": opening
+                    }).execute()
                     st.success("Added!")
                     st.rerun()
         vendors = fetch_vendors()
-        st.dataframe(vendors[['name', 'contact', 'opening_balance']])
+        st.dataframe(vendors[['name', 'contact', 'opening_balance']], use_container_width=True)
 
-# -------------------- Shift Recording Tab --------------------
-with tabs[2]:
-    st.header("Shift Recording")
+# -------------------- Shift Recording Page --------------------
+elif st.session_state.page == "Shift Recording":
+    st.title("📝 Shift Recording")
     
+    # Shift selection buttons
     col1, col2, col3 = st.columns(3)
     with col1:
         if st.button("🌅 Morning Shift", use_container_width=True):
             st.session_state.current_shift_name = "Morning"
-            st.session_state.current_date = st.date_input("Select Date", value=date.today(), key="morning_date")
+            st.session_state.current_date = date.today()
             shift_id = get_or_create_shift(st.session_state.current_date, "Morning")
             st.session_state.current_shift_id = shift_id
             st.rerun()
     with col2:
         if st.button("☀️ Evening Shift", use_container_width=True):
             st.session_state.current_shift_name = "Evening"
-            st.session_state.current_date = st.date_input("Select Date", value=date.today(), key="evening_date")
+            st.session_state.current_date = date.today()
             shift_id = get_or_create_shift(st.session_state.current_date, "Evening")
             st.session_state.current_shift_id = shift_id
             st.rerun()
     with col3:
         if st.button("🌙 Night Shift", use_container_width=True):
             st.session_state.current_shift_name = "Night"
-            st.session_state.current_date = st.date_input("Select Date", value=date.today(), key="night_date")
+            st.session_state.current_date = date.today()
             shift_id = get_or_create_shift(st.session_state.current_date, "Night")
             st.session_state.current_shift_id = shift_id
             st.rerun()
@@ -240,15 +277,16 @@ with tabs[2]:
     if st.session_state.current_shift_id:
         shift_id = st.session_state.current_shift_id
         shift_info = supabase.table("shifts").select("*").eq("id", shift_id).execute().data[0]
+        
         if shift_info['status'] == 'closed':
-            st.warning("This shift is already closed. You cannot edit it.")
+            st.warning("This shift is closed. You cannot edit it.")
             if st.button("Clear Selection"):
                 st.session_state.current_shift_id = None
                 st.rerun()
         else:
             st.subheader(f"Recording {st.session_state.current_shift_name} Shift - {shift_info['date']}")
             
-            # Opening cash display (read-only)
+            # Opening cash
             st.metric("Opening Cash", f"₹{shift_info['opening_cash']:,.2f}")
             
             # Total Sale
@@ -260,176 +298,184 @@ with tabs[2]:
             
             st.markdown("---")
             
-            # Expenses Section
+            # ========== EXPENSES ==========
             st.subheader("Expenses")
-            heads = fetch_expense_heads()
-            head_options = {row['name']: row['id'] for _, row in heads.iterrows()}
-            with st.form("add_expense"):
-                cola, colb, colc, cold = st.columns(4)
-                with cola:
-                    head_name = st.selectbox("Expense Head", list(head_options.keys()))
-                with colb:
-                    amount = st.number_input("Amount", min_value=0.01, step=10.0)
-                with colc:
-                    source = st.selectbox("Source", ["sales_cash", "owner_pocket"])
-                with cold:
-                    desc = st.text_input("Description (optional)")
-                submitted = st.form_submit_button("Add Expense")
-                if submitted:
+            heads_df = fetch_expense_heads()
+            head_options = {row['name']: row['id'] for _, row in heads_df.iterrows()}
+            
+            with st.form("expense_form"):
+                cols = st.columns(4)
+                with cols[0]:
+                    head = st.selectbox("Head", list(head_options.keys()), key="exp_head")
+                with cols[1]:
+                    amt = st.number_input("Amount", min_value=0.01, step=10.0, key="exp_amt")
+                with cols[2]:
+                    src = st.selectbox("Source", ["sales_cash", "owner_pocket"], key="exp_src")
+                with cols[3]:
+                    desc = st.text_input("Description", key="exp_desc")
+                if st.form_submit_button("Add Expense"):
+                    # Insert expense
                     supabase.table("expenses").insert({
                         "shift_id": shift_id,
-                        "expense_head_id": head_options[head_name],
-                        "amount": amount,
-                        "source": source,
+                        "expense_head_id": head_options[head],
+                        "amount": amt,
+                        "source": src,
                         "description": desc
                     }).execute()
+                    # If source is owner_pocket, record in owner ledger (owner puts in money)
+                    if src == "owner_pocket":
+                        record_owner_ledger(amt, f"Expense: {head}", shift_id)
                     update_expected_cash(shift_id)
                     st.success("Expense added")
                     st.rerun()
+            
             # Show existing expenses
             expenses = supabase.table("expenses").select("*, expense_heads(name)").eq("shift_id", shift_id).execute()
             if expenses.data:
                 df_exp = pd.DataFrame(expenses.data)
                 df_exp['head'] = df_exp['expense_heads'].apply(lambda x: x['name'])
-                st.dataframe(df_exp[['head', 'amount', 'source', 'description']])
+                st.dataframe(df_exp[['head', 'amount', 'source', 'description']], use_container_width=True)
             
             st.markdown("---")
             
-            # Vendor Payments Section
+            # ========== VENDOR PAYMENTS ==========
             st.subheader("Vendor Payments")
             vendors_df = fetch_vendors()
             vendor_options = {row['name']: row['id'] for _, row in vendors_df.iterrows()}
-            with st.form("add_payment"):
-                cola, colb, colc, cold = st.columns(4)
-                with cola:
-                    vendor_name = st.selectbox("Vendor", list(vendor_options.keys()))
-                with colb:
-                    amount = st.number_input("Amount", min_value=0.01, step=10.0, key="pay_amount")
-                with colc:
-                    source = st.selectbox("Source", ["sales_cash", "owner_pocket"], key="pay_source")
-                with cold:
+            
+            with st.form("payment_form"):
+                cols = st.columns(4)
+                with cols[0]:
+                    vendor = st.selectbox("Vendor", list(vendor_options.keys()), key="pay_vendor")
+                with cols[1]:
+                    amt = st.number_input("Amount", min_value=0.01, step=10.0, key="pay_amt")
+                with cols[2]:
+                    src = st.selectbox("Source", ["sales_cash", "owner_pocket"], key="pay_src")
+                with cols[3]:
                     desc = st.text_input("Description", key="pay_desc")
-                submitted = st.form_submit_button("Add Payment")
-                if submitted:
+                if st.form_submit_button("Add Payment"):
                     supabase.table("vendor_payments").insert({
                         "shift_id": shift_id,
-                        "vendor_id": vendor_options[vendor_name],
-                        "amount": amount,
-                        "source": source,
+                        "vendor_id": vendor_options[vendor],
+                        "amount": amt,
+                        "source": src,
                         "description": desc
                     }).execute()
+                    if src == "owner_pocket":
+                        record_owner_ledger(amt, f"Vendor Payment: {vendor}", shift_id)
                     update_expected_cash(shift_id)
                     st.success("Payment added")
                     st.rerun()
-            # Show existing payments
+            
             payments = supabase.table("vendor_payments").select("*, vendors(name)").eq("shift_id", shift_id).execute()
             if payments.data:
                 df_pay = pd.DataFrame(payments.data)
                 df_pay['vendor'] = df_pay['vendors'].apply(lambda x: x['name'])
-                st.dataframe(df_pay[['vendor', 'amount', 'source', 'description']])
+                st.dataframe(df_pay[['vendor', 'amount', 'source', 'description']], use_container_width=True)
             
             st.markdown("---")
             
-            # Purchases Section
+            # ========== PURCHASES ==========
             st.subheader("Purchases")
-            with st.form("add_purchase"):
-                cola, colb, colc, cold, cole = st.columns(5)
-                with cola:
-                    vendor_name = st.selectbox("Vendor", list(vendor_options.keys()), key="pur_vendor")
-                with colb:
-                    amount = st.number_input("Amount", min_value=0.01, step=10.0, key="pur_amount")
-                with colc:
-                    payment_type = st.selectbox("Payment Type", ["cash", "credit"])
-                with cold:
-                    source_if_cash = st.selectbox("Source if Cash", ["sales_cash", "owner_pocket"], disabled=payment_type!="cash")
-                with cole:
+            with st.form("purchase_form"):
+                cols = st.columns(5)
+                with cols[0]:
+                    vendor = st.selectbox("Vendor", list(vendor_options.keys()), key="pur_vendor")
+                with cols[1]:
+                    amt = st.number_input("Amount", min_value=0.01, step=10.0, key="pur_amt")
+                with cols[2]:
+                    pay_type = st.selectbox("Payment Type", ["cash", "credit"], key="pur_type")
+                with cols[3]:
+                    src = st.selectbox("Source if Cash", ["sales_cash", "owner_pocket"], 
+                                       disabled=pay_type!="cash", key="pur_src")
+                with cols[4]:
                     desc = st.text_input("Description", key="pur_desc")
-                submitted = st.form_submit_button("Add Purchase")
-                if submitted:
+                if st.form_submit_button("Add Purchase"):
                     data = {
                         "shift_id": shift_id,
-                        "vendor_id": vendor_options[vendor_name],
-                        "amount": amount,
-                        "payment_type": payment_type,
+                        "vendor_id": vendor_options[vendor],
+                        "amount": amt,
+                        "payment_type": pay_type,
                         "description": desc
                     }
-                    if payment_type == "cash":
-                        data["source_if_cash"] = source_if_cash
+                    if pay_type == "cash":
+                        data["source_if_cash"] = src
                     supabase.table("purchases").insert(data).execute()
-                    if payment_type == "cash" and source_if_cash == "sales_cash":
+                    if pay_type == "cash" and src == "owner_pocket":
+                        record_owner_ledger(amt, f"Purchase (cash) from {vendor}", shift_id)
+                    if pay_type == "cash" and src == "sales_cash":
                         update_expected_cash(shift_id)
                     st.success("Purchase added")
                     st.rerun()
-            # Show purchases
+            
             purchases = supabase.table("purchases").select("*, vendors(name)").eq("shift_id", shift_id).execute()
             if purchases.data:
                 df_pur = pd.DataFrame(purchases.data)
                 df_pur['vendor'] = df_pur['vendors'].apply(lambda x: x['name'])
-                st.dataframe(df_pur[['vendor', 'amount', 'payment_type', 'source_if_cash', 'description']])
+                st.dataframe(df_pur[['vendor', 'amount', 'payment_type', 'source_if_cash', 'description']], use_container_width=True)
             
             st.markdown("---")
             
-            # Returns Section
+            # ========== RETURNS ==========
             st.subheader("Returns to Vendors")
-            with st.form("add_return"):
-                cola, colb, colc = st.columns(3)
-                with cola:
-                    vendor_name = st.selectbox("Vendor", list(vendor_options.keys()), key="ret_vendor")
-                with colb:
-                    amount = st.number_input("Amount", min_value=0.01, step=10.0, key="ret_amount")
-                with colc:
+            with st.form("return_form"):
+                cols = st.columns(3)
+                with cols[0]:
+                    vendor = st.selectbox("Vendor", list(vendor_options.keys()), key="ret_vendor")
+                with cols[1]:
+                    amt = st.number_input("Amount", min_value=0.01, step=10.0, key="ret_amt")
+                with cols[2]:
                     desc = st.text_input("Description", key="ret_desc")
-                submitted = st.form_submit_button("Add Return")
-                if submitted:
+                if st.form_submit_button("Add Return"):
                     supabase.table("returns").insert({
                         "shift_id": shift_id,
-                        "vendor_id": vendor_options[vendor_name],
-                        "amount": amount,
+                        "vendor_id": vendor_options[vendor],
+                        "amount": amt,
                         "description": desc
                     }).execute()
-                    # Returns don't affect cash, but update vendor ledger only
                     st.success("Return added")
                     st.rerun()
-            # Show returns
+            
             returns = supabase.table("returns").select("*, vendors(name)").eq("shift_id", shift_id).execute()
             if returns.data:
                 df_ret = pd.DataFrame(returns.data)
                 df_ret['vendor'] = df_ret['vendors'].apply(lambda x: x['name'])
-                st.dataframe(df_ret[['vendor', 'amount', 'description']])
+                st.dataframe(df_ret[['vendor', 'amount', 'description']], use_container_width=True)
             
             st.markdown("---")
             
-            # Withdrawals Section
-            st.subheader("Withdrawals")
-            with st.form("add_withdrawal"):
-                cola, colb = st.columns(2)
-                with cola:
-                    amount = st.number_input("Amount", min_value=0.01, step=10.0, key="with_amount")
-                with colb:
-                    desc = st.text_input("Description", key="with_desc")
-                submitted = st.form_submit_button("Add Withdrawal")
-                if submitted:
+            # ========== WITHDRAWALS ==========
+            st.subheader("Withdrawals (Owner takes cash)")
+            with st.form("withdrawal_form"):
+                cols = st.columns(2)
+                with cols[0]:
+                    amt = st.number_input("Amount", min_value=0.01, step=10.0, key="wd_amt")
+                with cols[1]:
+                    desc = st.text_input("Description", key="wd_desc")
+                if st.form_submit_button("Add Withdrawal"):
                     supabase.table("withdrawals").insert({
                         "shift_id": shift_id,
-                        "amount": amount,
+                        "amount": amt,
                         "description": desc
                     }).execute()
+                    # Record in owner ledger as negative (owner withdraws)
+                    record_owner_ledger(-amt, f"Withdrawal: {desc}", shift_id)
                     update_expected_cash(shift_id)
                     st.success("Withdrawal added")
                     st.rerun()
-            # Show withdrawals
+            
             withdrawals = supabase.table("withdrawals").select("*").eq("shift_id", shift_id).execute()
             if withdrawals.data:
-                df_with = pd.DataFrame(withdrawals.data)
-                st.dataframe(df_with[['amount', 'description']])
+                df_wd = pd.DataFrame(withdrawals.data)
+                st.dataframe(df_wd[['amount', 'description']], use_container_width=True)
             
             st.markdown("---")
             
-            # Closing Cash
+            # ========== CLOSE SHIFT ==========
             st.subheader("Close Shift")
             expected = calculate_expected_cash(shift_id)
             st.metric("Expected Cash", f"₹{expected:,.2f}")
-            closing = st.number_input("Enter Closing Cash", min_value=0.0, step=100.0, key="closing_cash")
+            closing = st.number_input("Enter Closing Cash", min_value=0.0, step=100.0)
             if st.button("Close Shift"):
                 if closing >= 0:
                     close_shift(shift_id, closing)
@@ -437,120 +483,233 @@ with tabs[2]:
                     st.session_state.current_shift_id = None
                     st.rerun()
                 else:
-                    st.error("Please enter a valid amount")
+                    st.error("Invalid amount")
 
-# -------------------- Reports Tab --------------------
-with tabs[3]:
-    st.header("Reports")
+# -------------------- Reports Page --------------------
+elif st.session_state.page == "Reports":
+    st.title("📈 Reports")
     
-    report_type = st.selectbox("Select Report Type", 
+    report_type = st.selectbox("Report Type", 
                                 ["Expense Head Wise", "All Expenses", "Sales Summary", 
-                                 "Shift Wise", "Withdrawals", "Payments", "Vendor Ledger"])
+                                 "Shift Wise Summary", "Withdrawals", "Vendor Payments", 
+                                 "Vendor Ledger", "Owner Ledger"])
     
-    if report_type == "Expense Head Wise":
-        st.subheader("Expense Head Wise Report")
+    # Date range filter
+    col1, col2 = st.columns(2)
+    with col1:
         start_date = st.date_input("Start Date", value=date.today().replace(day=1))
+    with col2:
         end_date = st.date_input("End Date", value=date.today())
-        if st.button("Generate"):
-            # Get shifts in date range
-            shifts = supabase.table("shifts").select("id").gte("date", start_date).lte("date", end_date).execute()
-            shift_ids = [s['id'] for s in shifts.data]
-            if shift_ids:
-                expenses = supabase.table("expenses").select("amount, expense_heads(name)").in_("shift_id", shift_ids).execute()
-                df = pd.DataFrame(expenses.data)
-                df['head'] = df['expense_heads'].apply(lambda x: x['name'])
-                summary = df.groupby('head')['amount'].sum().reset_index()
-                fig = px.bar(summary, x='head', y='amount', title="Expenses by Head")
-                st.plotly_chart(fig)
-                st.dataframe(summary)
-            else:
-                st.info("No data in selected range")
     
-    elif report_type == "All Expenses":
-        st.subheader("All Expenses Report")
-        start_date = st.date_input("Start Date", value=date.today().replace(day=1))
-        end_date = st.date_input("End Date", value=date.today())
-        if st.button("Generate"):
-            shifts = supabase.table("shifts").select("id, date, shift_name").gte("date", start_date).lte("date", end_date).execute()
-            shift_ids = [s['id'] for s in shifts.data]
-            if shift_ids:
-                expenses = supabase.table("expenses").select("*, expense_heads(name), shifts(date, shift_name)").in_("shift_id", shift_ids).execute()
+    # Global search filter
+    search_term = st.text_input("🔍 Search (applies to all text columns)")
+    
+    # Function to filter dataframe based on search
+    def filter_df(df, search):
+        if search and not df.empty:
+            mask = df.astype(str).apply(lambda x: x.str.contains(search, case=False, na=False)).any(axis=1)
+            return df[mask]
+        return df
+    
+    # Fetch data based on report type
+    if report_type in ["Expense Head Wise", "All Expenses"]:
+        # Get shifts in date range
+        shifts = supabase.table("shifts").select("id, date, shift_name").gte("date", start_date.isoformat()).lte("date", end_date.isoformat()).execute()
+        shift_ids = [s['id'] for s in shifts.data] if shifts.data else []
+        if not shift_ids:
+            st.info("No data in selected range")
+        else:
+            expenses = supabase.table("expenses").select("*, expense_heads(name), shifts(date, shift_name)").in_("shift_id", shift_ids).execute()
+            if expenses.data:
                 df = pd.DataFrame(expenses.data)
                 df['head'] = df['expense_heads'].apply(lambda x: x['name'])
                 df['date'] = df['shifts'].apply(lambda x: x['date'])
                 df['shift'] = df['shifts'].apply(lambda x: x['shift_name'])
-                st.dataframe(df[['date', 'shift', 'head', 'amount', 'source', 'description']])
+                df = df[['date', 'shift', 'head', 'amount', 'source', 'description']]
+                
+                if report_type == "Expense Head Wise":
+                    # Group by head
+                    summary = df.groupby('head')['amount'].sum().reset_index()
+                    fig = px.bar(summary, x='head', y='amount', title="Expenses by Head")
+                    st.plotly_chart(fig)
+                    st.dataframe(summary, use_container_width=True)
+                else:
+                    # All expenses with search
+                    df_filtered = filter_df(df, search_term)
+                    st.dataframe(df_filtered, use_container_width=True)
             else:
-                st.info("No data")
+                st.info("No expenses found")
+    
+    elif report_type == "Sales Summary":
+        shifts = supabase.table("shifts").select("date, shift_name, total_sale").gte("date", start_date.isoformat()).lte("date", end_date.isoformat()).execute()
+        if shifts.data:
+            df = pd.DataFrame(shifts.data)
+            df['date'] = pd.to_datetime(df['date'])
+            df = df.sort_values('date')
+            fig = px.line(df, x='date', y='total_sale', color='shift_name', title="Daily Sales by Shift")
+            st.plotly_chart(fig)
+            st.dataframe(df, use_container_width=True)
+        else:
+            st.info("No sales data")
+    
+    elif report_type == "Shift Wise Summary":
+        shifts = supabase.table("shifts").select("*").gte("date", start_date.isoformat()).lte("date", end_date.isoformat()).execute()
+        if shifts.data:
+            df = pd.DataFrame(shifts.data)
+            df = df[['date', 'shift_name', 'opening_cash', 'total_sale', 'expected_cash', 'closing_cash_entered', 'status']]
+            df_filtered = filter_df(df, search_term)
+            st.dataframe(df_filtered, use_container_width=True)
+        else:
+            st.info("No shift data")
+    
+    elif report_type == "Withdrawals":
+        shifts = supabase.table("shifts").select("id").gte("date", start_date.isoformat()).lte("date", end_date.isoformat()).execute()
+        shift_ids = [s['id'] for s in shifts.data] if shifts.data else []
+        if shift_ids:
+            wd = supabase.table("withdrawals").select("*, shifts(date, shift_name)").in_("shift_id", shift_ids).execute()
+            if wd.data:
+                df = pd.DataFrame(wd.data)
+                df['date'] = df['shifts'].apply(lambda x: x['date'])
+                df['shift'] = df['shifts'].apply(lambda x: x['shift_name'])
+                df = df[['date', 'shift', 'amount', 'description']]
+                df_filtered = filter_df(df, search_term)
+                st.dataframe(df_filtered, use_container_width=True)
+            else:
+                st.info("No withdrawals")
+        else:
+            st.info("No data")
+    
+    elif report_type == "Vendor Payments":
+        shifts = supabase.table("shifts").select("id").gte("date", start_date.isoformat()).lte("date", end_date.isoformat()).execute()
+        shift_ids = [s['id'] for s in shifts.data] if shifts.data else []
+        if shift_ids:
+            pays = supabase.table("vendor_payments").select("*, vendors(name), shifts(date, shift_name)").in_("shift_id", shift_ids).execute()
+            if pays.data:
+                df = pd.DataFrame(pays.data)
+                df['vendor'] = df['vendors'].apply(lambda x: x['name'])
+                df['date'] = df['shifts'].apply(lambda x: x['date'])
+                df['shift'] = df['shifts'].apply(lambda x: x['shift_name'])
+                df = df[['date', 'shift', 'vendor', 'amount', 'source', 'description']]
+                df_filtered = filter_df(df, search_term)
+                st.dataframe(df_filtered, use_container_width=True)
+            else:
+                st.info("No payments")
+        else:
+            st.info("No data")
     
     elif report_type == "Vendor Ledger":
-        st.subheader("Vendor Ledger")
         vendors_df = fetch_vendors()
         vendor_options = {row['name']: row['id'] for _, row in vendors_df.iterrows()}
         vendor = st.selectbox("Select Vendor", list(vendor_options.keys()))
-        start_date = st.date_input("Start Date", value=date.today().replace(day=1))
-        end_date = st.date_input("End Date", value=date.today())
-        if st.button("Generate"):
+        
+        if st.button("Generate Ledger"):
             vendor_id = vendor_options[vendor]
-            # Fetch all transactions for this vendor: purchases, payments, returns
+            
+            # Get opening balance
+            vendor_info = supabase.table("vendors").select("opening_balance").eq("id", vendor_id).execute().data[0]
+            opening = vendor_info['opening_balance'] or 0
+            
+            # Fetch all transactions for this vendor within date range
             purchases = supabase.table("purchases").select("amount, payment_type, created_at, description").eq("vendor_id", vendor_id).gte("created_at", start_date.isoformat()).lte("created_at", end_date.isoformat()).execute()
             payments = supabase.table("vendor_payments").select("amount, source, created_at, description").eq("vendor_id", vendor_id).gte("created_at", start_date.isoformat()).lte("created_at", end_date.isoformat()).execute()
             returns = supabase.table("returns").select("amount, created_at, description").eq("vendor_id", vendor_id).gte("created_at", start_date.isoformat()).lte("created_at", end_date.isoformat()).execute()
             
-            # Combine into ledger with running balance
+            # Build ledger with running balance
             ledger = []
+            balance = opening
+            
+            # Add opening row
+            ledger.append({
+                "date": start_date.isoformat(),
+                "type": "Opening Balance",
+                "debit": 0,
+                "credit": 0,
+                "balance": balance,
+                "description": "Opening"
+            })
+            
             for p in purchases.data:
-                ledger.append({
-                    "date": p['created_at'],
-                    "type": "Purchase",
-                    "debit": p['amount'],
-                    "credit": 0,
-                    "payment_type": p['payment_type'],
-                    "description": p.get('description','')
-                })
+                amount = p['amount']
+                if p['payment_type'] == 'credit':
+                    balance += amount  # credit purchase increases what we owe (liability)
+                    ledger.append({
+                        "date": p['created_at'],
+                        "type": "Credit Purchase",
+                        "debit": amount,
+                        "credit": 0,
+                        "balance": balance,
+                        "description": p.get('description','')
+                    })
+                else:  # cash purchase - no ledger effect except if credit? Actually cash purchase doesn't change vendor balance, but we may want to show it for completeness.
+                    # For vendor ledger, cash purchase doesn't affect balance (paid immediately)
+                    ledger.append({
+                        "date": p['created_at'],
+                        "type": "Cash Purchase",
+                        "debit": 0,
+                        "credit": 0,
+                        "balance": balance,
+                        "description": p.get('description','') + " (cash)"
+                    })
+            
             for p in payments.data:
+                amount = p['amount']
+                balance -= amount  # payment reduces what we owe
                 ledger.append({
                     "date": p['created_at'],
                     "type": "Payment",
                     "debit": 0,
-                    "credit": p['amount'],
-                    "source": p['source'],
+                    "credit": amount,
+                    "balance": balance,
                     "description": p.get('description','')
                 })
+            
             for r in returns.data:
+                amount = r['amount']
+                balance -= amount  # return reduces what we owe
                 ledger.append({
                     "date": r['created_at'],
                     "type": "Return",
                     "debit": 0,
-                    "credit": r['amount'],
+                    "credit": amount,
+                    "balance": balance,
                     "description": r.get('description','')
                 })
+            
             df = pd.DataFrame(ledger)
             if not df.empty:
                 df = df.sort_values('date')
-                df['balance'] = (df['debit'] - df['credit']).cumsum()
-                st.dataframe(df)
+                st.dataframe(df, use_container_width=True)
+                
+                # PDF download (simple)
+                if st.button("Download PDF"):
+                    pdf = FPDF()
+                    pdf.add_page()
+                    pdf.set_font("Arial", size=10)
+                    pdf.cell(200, 10, txt=f"Vendor Ledger: {vendor}", ln=1, align='C')
+                    pdf.ln(5)
+                    # Simple table
+                    cols = df.columns.tolist()
+                    for col in cols:
+                        pdf.cell(40, 8, col, border=1)
+                    pdf.ln()
+                    for _, row in df.iterrows():
+                        for val in row:
+                            pdf.cell(40, 8, str(val)[:20], border=1)
+                        pdf.ln()
+                    pdf_output = pdf.output(dest='S').encode('latin1')
+                    b64 = base64.b64encode(pdf_output).decode()
+                    href = f'<a href="data:application/octet-stream;base64,{b64}" download="ledger.pdf">Download PDF</a>'
+                    st.markdown(href, unsafe_allow_html=True)
             else:
                 st.info("No transactions")
     
-    # PDF download function (simplified)
-    def create_pdf(df, title):
-        pdf = FPDF()
-        pdf.add_page()
-        pdf.set_font("Arial", size=12)
-        pdf.cell(200, 10, txt=title, ln=1, align='C')
-        pdf.ln(10)
-        # Simple table
-        col_width = pdf.w / (len(df.columns) + 1)
-        for col in df.columns:
-            pdf.cell(col_width, 10, str(col), border=1)
-        pdf.ln()
-        for _, row in df.iterrows():
-            for item in row:
-                pdf.cell(col_width, 10, str(item), border=1)
-            pdf.ln()
-        return pdf.output(dest='S').encode('latin1')
-    
-    if st.button("Download as PDF"):
-        # Dummy implementation - in real code, you'd generate based on current report
-        st.info("PDF generation ready - implement based on report data")
+    elif report_type == "Owner Ledger":
+        if st.button("Generate Owner Ledger"):
+            # Fetch all owner transactions within date range
+            owner_tx = supabase.table("owner_ledger").select("*").gte("transaction_date", start_date.isoformat()).lte("transaction_date", end_date.isoformat()).order("transaction_date").execute()
+            if owner_tx.data:
+                df = pd.DataFrame(owner_tx.data)
+                df['running_balance'] = df['amount'].cumsum()
+                st.dataframe(df[['transaction_date', 'amount', 'description', 'running_balance']], use_container_width=True)
+            else:
+                st.info("No owner transactions")
