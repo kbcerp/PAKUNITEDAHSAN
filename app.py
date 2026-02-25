@@ -30,7 +30,6 @@ supabase = init_supabase()
 
 # -------------------- Database Connectivity Check --------------------
 def check_database():
-    """Verify that required tables exist by querying a known table."""
     tables = ["shifts", "expense_heads", "vendors", "owner_ledger"]
     missing = []
     for table in tables:
@@ -73,6 +72,43 @@ def login():
 if not st.session_state.authenticated:
     login()
     st.stop()
+
+# -------------------- PDF Generation Helper --------------------
+def generate_pdf(title, df, columns, totals_row=None, filename="report.pdf"):
+    """Generate a PDF from a DataFrame with proper formatting."""
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", "B", 14)
+    pdf.cell(0, 10, title, 0, 1, "C")
+    pdf.ln(5)
+
+    pdf.set_font("Arial", "B", 10)
+    col_width = pdf.w / (len(columns) + 1) if len(columns) < 8 else 25
+    # Header
+    for col in columns:
+        pdf.cell(col_width, 8, col, 1, 0, "C")
+    pdf.ln()
+
+    # Data
+    pdf.set_font("Arial", "", 9)
+    for _, row in df.iterrows():
+        for col in columns:
+            val = str(row[col]) if col in row else ""
+            pdf.cell(col_width, 8, val[:30], 1, 0, "L" if col != "amount" else "R")
+        pdf.ln()
+
+    # Totals row if provided
+    if totals_row:
+        pdf.set_font("Arial", "B", 9)
+        for i, col in enumerate(columns):
+            if i == 0:
+                pdf.cell(col_width, 8, "TOTAL", 1, 0, "L")
+            else:
+                val = totals_row.get(col, "")
+                pdf.cell(col_width, 8, str(val), 1, 0, "R" if col == "amount" else "L")
+        pdf.ln()
+
+    return pdf.output(dest="S").encode("latin1")
 
 # -------------------- Helper Functions (with safe calls) --------------------
 def fetch_expense_heads():
@@ -242,13 +278,13 @@ def record_owner_ledger(amount, description, shift_id=None):
         st.error(f"Failed to record owner ledger: {msg}")
 
 # -------------------- Navigation --------------------
-st.sidebar.title("Medical Store")
-pages = ["Dashboard", "Heads Setup", "Shift Recording", "Reports"]
+st.sidebar.title("🏥 Medical Store")
+pages = ["📊 Dashboard", "⚙️ Heads Setup", "📝 Shift Recording", "📈 Reports"]
 choice = st.sidebar.radio("Go to", pages, index=pages.index(st.session_state.page))
 st.session_state.page = choice
 
 # -------------------- Dashboard Page --------------------
-if st.session_state.page == "Dashboard":
+if st.session_state.page == "📊 Dashboard":
     st.title("📊 Dashboard")
     col1, col2 = st.columns([1, 3])
     with col1:
@@ -300,7 +336,7 @@ if st.session_state.page == "Dashboard":
                     st.write(f"Closing Cash Entered: ₹{shift['closing_cash_entered']:,.2f}")
 
 # -------------------- Heads Setup Page --------------------
-elif st.session_state.page == "Heads Setup":
+elif st.session_state.page == "⚙️ Heads Setup":
     st.title("⚙️ Heads & Vendors")
     tab1, tab2 = st.tabs(["Expense Heads", "Vendors"])
 
@@ -346,7 +382,7 @@ elif st.session_state.page == "Heads Setup":
             st.dataframe(vendors[['name', 'contact', 'opening_balance']], use_container_width=True)
 
 # -------------------- Shift Recording Page --------------------
-elif st.session_state.page == "Shift Recording":
+elif st.session_state.page == "📝 Shift Recording":
     st.title("📝 Shift Recording")
 
     col1, col2, col3 = st.columns(3)
@@ -632,12 +668,12 @@ elif st.session_state.page == "Shift Recording":
                     st.error("Invalid amount")
 
 # -------------------- Reports Page --------------------
-elif st.session_state.page == "Reports":
+elif st.session_state.page == "📈 Reports":
     st.title("📈 Reports")
     report_type = st.selectbox("Report Type",
                                 ["Expense Head Wise", "All Expenses", "Sales Summary",
-                                 "Shift Wise Summary", "Withdrawals", "Vendor Payments",
-                                 "Vendor Ledger", "Owner Ledger"])
+                                 "Shift Wise Summary", "Owner Transactions", "Vendor Payments",
+                                 "Vendor Ledger", "Profit & Loss"])
     col1, col2 = st.columns(2)
     with col1:
         start_date = st.date_input("Start Date", value=date.today().replace(day=1))
@@ -663,6 +699,7 @@ elif st.session_state.page == "Reports":
         st.stop()
     shift_ids = [s['id'] for s in shifts_res.data] if shifts_res.data else []
 
+    # -------------------- Expense Reports --------------------
     if report_type in ["Expense Head Wise", "All Expenses"]:
         if not shift_ids:
             st.info("No shifts in selected range")
@@ -687,12 +724,27 @@ elif st.session_state.page == "Reports":
                     fig = px.bar(summary, x='head', y='amount', title="Expenses by Head")
                     st.plotly_chart(fig)
                     st.dataframe(summary, use_container_width=True)
+                    # PDF
+                    if st.button("Download PDF (Expense Head Wise)"):
+                        pdf_bytes = generate_pdf("Expense Head Wise", summary, ['head', 'amount'])
+                        b64 = base64.b64encode(pdf_bytes).decode()
+                        href = f'<a href="data:application/octet-stream;base64,{b64}" download="expense_head_wise.pdf">Download PDF</a>'
+                        st.markdown(href, unsafe_allow_html=True)
                 else:
                     df_filtered = filter_df(df, search_term)
                     st.dataframe(df_filtered, use_container_width=True)
+                    # PDF with totals
+                    if st.button("Download PDF (All Expenses)"):
+                        total = df['amount'].sum()
+                        totals_row = {'date': '', 'shift': '', 'head': 'TOTAL', 'amount': total, 'source': '', 'description': ''}
+                        pdf_bytes = generate_pdf("All Expenses", df_filtered, df.columns.tolist(), totals_row)
+                        b64 = base64.b64encode(pdf_bytes).decode()
+                        href = f'<a href="data:application/octet-stream;base64,{b64}" download="all_expenses.pdf">Download PDF</a>'
+                        st.markdown(href, unsafe_allow_html=True)
             else:
                 st.info("No expenses found")
 
+    # -------------------- Sales Summary --------------------
     elif report_type == "Sales Summary":
         if shifts_res.data:
             df = pd.DataFrame(shifts_res.data)
@@ -701,52 +753,101 @@ elif st.session_state.page == "Reports":
             fig = px.line(df, x='date', y='total_sale', color='shift_name', title="Daily Sales by Shift")
             st.plotly_chart(fig)
             st.dataframe(df, use_container_width=True)
+            if st.button("Download PDF (Sales Summary)"):
+                pdf_bytes = generate_pdf("Sales Summary", df, ['date', 'shift_name', 'total_sale'])
+                b64 = base64.b64encode(pdf_bytes).decode()
+                href = f'<a href="data:application/octet-stream;base64,{b64}" download="sales_summary.pdf">Download PDF</a>'
+                st.markdown(href, unsafe_allow_html=True)
         else:
             st.info("No sales data")
 
+    # -------------------- Shift Wise Summary --------------------
     elif report_type == "Shift Wise Summary":
-        if shifts_res.data:
-            df = pd.DataFrame(shifts_res.data)
-            # Fetch full details for each shift
+        if shift_ids:
             full = []
             for sid in shift_ids:
                 s_res, err, msg = safe_supabase_call(
                     lambda sid=sid: supabase.table("shifts").select("*").eq("id", sid).execute()
                 )
                 if not err and s_res.data:
-                    full.append(s_res.data[0])
+                    shift = s_res.data[0]
+                    # Fetch totals for this shift
+                    exp_res, _, _ = safe_supabase_call(
+                        lambda: supabase.table("expenses").select("amount").eq("shift_id", sid).execute()
+                    )
+                    total_exp = sum([e['amount'] for e in exp_res.data]) if exp_res.data else 0
+
+                    wd_res, _, _ = safe_supabase_call(
+                        lambda: supabase.table("withdrawals").select("amount").eq("shift_id", sid).execute()
+                    )
+                    total_wd = sum([w['amount'] for w in wd_res.data]) if wd_res.data else 0
+
+                    pay_res, _, _ = safe_supabase_call(
+                        lambda: supabase.table("vendor_payments").select("amount").eq("shift_id", sid).execute()
+                    )
+                    total_pay = sum([p['amount'] for p in pay_res.data]) if pay_res.data else 0
+
+                    pur_res, _, _ = safe_supabase_call(
+                        lambda: supabase.table("purchases").select("amount").eq("shift_id", sid).execute()
+                    )
+                    total_pur = sum([p['amount'] for p in pur_res.data]) if pur_res.data else 0
+
+                    full.append({
+                        "Date": shift['date'],
+                        "Shift": shift['shift_name'],
+                        "Opening Cash": shift['opening_cash'],
+                        "Total Sale": shift['total_sale'],
+                        "Expenses": total_exp,
+                        "Withdrawals": total_wd,
+                        "Vendor Payments": total_pay,
+                        "Purchases": total_pur,
+                        "Expected Cash": shift['expected_cash'],
+                        "Closing Cash": shift['closing_cash_entered'] if shift['closing_cash_entered'] else ""
+                    })
             if full:
                 df = pd.DataFrame(full)
-                df = df[['date', 'shift_name', 'opening_cash', 'total_sale', 'expected_cash', 'closing_cash_entered', 'status']]
                 df_filtered = filter_df(df, search_term)
                 st.dataframe(df_filtered, use_container_width=True)
+                if st.button("Download PDF (Shift Wise)"):
+                    pdf_bytes = generate_pdf("Shift Wise Summary", df_filtered, df.columns.tolist())
+                    b64 = base64.b64encode(pdf_bytes).decode()
+                    href = f'<a href="data:application/octet-stream;base64,{b64}" download="shift_wise.pdf">Download PDF</a>'
+                    st.markdown(href, unsafe_allow_html=True)
             else:
                 st.info("No shift details")
         else:
-            st.info("No shift data")
+            st.info("No shifts in range")
 
-    elif report_type == "Withdrawals":
-        if shift_ids:
-            wd_res, err, msg = safe_supabase_call(
-                lambda: supabase.table("withdrawals")
-                .select("*, shifts(date, shift_name)")
-                .in_("shift_id", shift_ids)
-                .execute()
-            )
-            if err:
-                st.error(f"Failed: {msg}")
-            elif wd_res.data:
-                df = pd.DataFrame(wd_res.data)
-                df['date'] = df['shifts'].apply(lambda x: x['date'])
-                df['shift'] = df['shifts'].apply(lambda x: x['shift_name'])
-                df = df[['date', 'shift', 'amount', 'description']]
-                df_filtered = filter_df(df, search_term)
-                st.dataframe(df_filtered, use_container_width=True)
-            else:
-                st.info("No withdrawals")
+    # -------------------- Owner Transactions --------------------
+    elif report_type == "Owner Transactions":
+        own_res, err, msg = safe_supabase_call(
+            lambda: supabase.table("owner_ledger")
+            .select("*")
+            .gte("transaction_date", start_date.isoformat())
+            .lte("transaction_date", end_date.isoformat())
+            .order("transaction_date")
+            .execute()
+        )
+        if err:
+            st.error(f"Failed: {msg}")
+        elif own_res.data:
+            df = pd.DataFrame(own_res.data)
+            df['type'] = df['amount'].apply(lambda x: "Investment" if x > 0 else "Withdrawal")
+            df['amount_abs'] = df['amount'].abs()
+            df['running_balance'] = df['amount'].cumsum()
+            df = df[['transaction_date', 'type', 'amount_abs', 'description', 'running_balance']]
+            df.columns = ['Date', 'Type', 'Amount', 'Description', 'Balance']
+            df_filtered = filter_df(df, search_term)
+            st.dataframe(df_filtered, use_container_width=True)
+            if st.button("Download PDF (Owner Transactions)"):
+                pdf_bytes = generate_pdf("Owner Transactions", df_filtered, df.columns.tolist())
+                b64 = base64.b64encode(pdf_bytes).decode()
+                href = f'<a href="data:application/octet-stream;base64,{b64}" download="owner_transactions.pdf">Download PDF</a>'
+                st.markdown(href, unsafe_allow_html=True)
         else:
-            st.info("No data")
+            st.info("No owner transactions")
 
+    # -------------------- Vendor Payments --------------------
     elif report_type == "Vendor Payments":
         if shift_ids:
             pay_res, err, msg = safe_supabase_call(
@@ -765,11 +866,19 @@ elif st.session_state.page == "Reports":
                 df = df[['date', 'shift', 'vendor', 'amount', 'source', 'description']]
                 df_filtered = filter_df(df, search_term)
                 st.dataframe(df_filtered, use_container_width=True)
+                if st.button("Download PDF (Vendor Payments)"):
+                    total = df['amount'].sum()
+                    totals_row = {'date': '', 'shift': '', 'vendor': 'TOTAL', 'amount': total, 'source': '', 'description': ''}
+                    pdf_bytes = generate_pdf("Vendor Payments", df_filtered, df.columns.tolist(), totals_row)
+                    b64 = base64.b64encode(pdf_bytes).decode()
+                    href = f'<a href="data:application/octet-stream;base64,{b64}" download="vendor_payments.pdf">Download PDF</a>'
+                    st.markdown(href, unsafe_allow_html=True)
             else:
                 st.info("No payments")
         else:
             st.info("No data")
 
+    # -------------------- Vendor Ledger --------------------
     elif report_type == "Vendor Ledger":
         vendors_df = fetch_vendors()
         if not vendors_df.empty:
@@ -809,96 +918,125 @@ elif st.session_state.page == "Reports":
                     )
                     ledger = []
                     balance = opening
+                    # Opening row
                     ledger.append({
-                        "date": start_date.isoformat(),
-                        "type": "Opening Balance",
-                        "debit": 0,
-                        "credit": 0,
-                        "balance": balance,
-                        "description": "Opening"
+                        "Date": start_date.isoformat(),
+                        "Transaction Type": "Opening",
+                        "Debit": 0,
+                        "Credit": 0,
+                        "Balance": balance,
+                        "Payment Mode": "",
+                        "Description": "Opening Balance"
                     })
                     for p in pur_res.data if pur_res.data else []:
                         if p['payment_type'] == 'credit':
                             balance += p['amount']
                             ledger.append({
-                                "date": p['created_at'],
-                                "type": "Credit Purchase",
-                                "debit": p['amount'],
-                                "credit": 0,
-                                "balance": balance,
-                                "description": p.get('description','')
+                                "Date": p['created_at'][:10],
+                                "Transaction Type": "Purchase",
+                                "Debit": p['amount'],
+                                "Credit": 0,
+                                "Balance": balance,
+                                "Payment Mode": "Credit",
+                                "Description": p.get('description','')
                             })
                         else:
+                            # Cash purchase does not affect ledger balance, but we may show for info
                             ledger.append({
-                                "date": p['created_at'],
-                                "type": "Cash Purchase",
-                                "debit": 0,
-                                "credit": 0,
-                                "balance": balance,
-                                "description": p.get('description','') + " (cash)"
+                                "Date": p['created_at'][:10],
+                                "Transaction Type": "Purchase",
+                                "Debit": 0,
+                                "Credit": 0,
+                                "Balance": balance,
+                                "Payment Mode": "Cash",
+                                "Description": p.get('description','') + " (cash)"
                             })
                     for p in pay_res.data if pay_res.data else []:
                         balance -= p['amount']
+                        mode = "Cash" if p['source'] == "sales_cash" else "Owner Pocket"
                         ledger.append({
-                            "date": p['created_at'],
-                            "type": "Payment",
-                            "debit": 0,
-                            "credit": p['amount'],
-                            "balance": balance,
-                            "description": p.get('description','')
+                            "Date": p['created_at'][:10],
+                            "Transaction Type": "Payment",
+                            "Debit": 0,
+                            "Credit": p['amount'],
+                            "Balance": balance,
+                            "Payment Mode": mode,
+                            "Description": p.get('description','')
                         })
                     for r in ret_res.data if ret_res.data else []:
                         balance -= r['amount']
                         ledger.append({
-                            "date": r['created_at'],
-                            "type": "Return",
-                            "debit": 0,
-                            "credit": r['amount'],
-                            "balance": balance,
-                            "description": r.get('description','')
+                            "Date": r['created_at'][:10],
+                            "Transaction Type": "Return",
+                            "Debit": 0,
+                            "Credit": r['amount'],
+                            "Balance": balance,
+                            "Payment Mode": "N/A",
+                            "Description": r.get('description','')
                         })
                     df = pd.DataFrame(ledger)
                     if not df.empty:
-                        df = df.sort_values('date')
+                        df = df.sort_values('Date')
                         st.dataframe(df, use_container_width=True)
-                        if st.button("Download PDF"):
-                            pdf = FPDF()
-                            pdf.add_page()
-                            pdf.set_font("Arial", size=10)
-                            pdf.cell(200, 10, txt=f"Vendor Ledger: {vendor}", ln=1, align='C')
-                            pdf.ln(5)
-                            cols = df.columns.tolist()
-                            for col in cols:
-                                pdf.cell(40, 8, col, border=1)
-                            pdf.ln()
-                            for _, row in df.iterrows():
-                                for val in row:
-                                    pdf.cell(40, 8, str(val)[:20], border=1)
-                                pdf.ln()
-                            pdf_output = pdf.output(dest='S').encode('latin1')
-                            b64 = base64.b64encode(pdf_output).decode()
-                            href = f'<a href="data:application/octet-stream;base64,{b64}" download="ledger.pdf">Download PDF</a>'
+                        if st.button("Download PDF (Vendor Ledger)"):
+                            pdf_bytes = generate_pdf(f"Vendor Ledger: {vendor}", df, df.columns.tolist())
+                            b64 = base64.b64encode(pdf_bytes).decode()
+                            href = f'<a href="data:application/octet-stream;base64,{b64}" download="vendor_ledger.pdf">Download PDF</a>'
                             st.markdown(href, unsafe_allow_html=True)
                     else:
                         st.info("No transactions")
         else:
             st.info("No vendors available")
 
-    elif report_type == "Owner Ledger":
-        if st.button("Generate Owner Ledger"):
-            own_res, err, msg = safe_supabase_call(
-                lambda: supabase.table("owner_ledger")
-                .select("*")
-                .gte("transaction_date", start_date.isoformat())
-                .lte("transaction_date", end_date.isoformat())
-                .order("transaction_date")
-                .execute()
+    # -------------------- Profit & Loss --------------------
+    elif report_type == "Profit & Loss":
+        if not shift_ids:
+            st.info("No shifts in selected range")
+        else:
+            # Calculate totals
+            # Sales
+            sales = sum([s['total_sale'] for s in shifts_res.data]) if shifts_res.data else 0
+
+            # Purchases (COGS) – we assume purchases are cost of goods sold; returns reduce COGS
+            pur_res, err, msg = safe_supabase_call(
+                lambda: supabase.table("purchases").select("amount").in_("shift_id", shift_ids).execute()
             )
-            if err:
-                st.error(f"Failed: {msg}")
-            elif own_res.data:
-                df = pd.DataFrame(own_res.data)
-                df['running_balance'] = df['amount'].cumsum()
-                st.dataframe(df[['transaction_date', 'amount', 'description', 'running_balance']], use_container_width=True)
-            else:
-                st.info("No owner transactions")
+            total_purchases = sum([p['amount'] for p in pur_res.data]) if not err and pur_res.data else 0
+
+            ret_res, err, msg = safe_supabase_call(
+                lambda: supabase.table("returns").select("amount").in_("shift_id", shift_ids).execute()
+            )
+            total_returns = sum([r['amount'] for r in ret_res.data]) if not err and ret_res.data else 0
+
+            cogs = total_purchases - total_returns
+
+            # Expenses
+            exp_res, err, msg = safe_supabase_call(
+                lambda: supabase.table("expenses").select("amount").in_("shift_id", shift_ids).execute()
+            )
+            total_expenses = sum([e['amount'] for e in exp_res.data]) if not err and exp_res.data else 0
+
+            gross_profit = sales - cogs
+            net_profit = gross_profit - total_expenses
+
+            # Display
+            cola, colb, colc, cold, cole = st.columns(5)
+            cola.metric("Total Sales", f"₹{sales:,.2f}")
+            colb.metric("COGS (Purchases - Returns)", f"₹{cogs:,.2f}")
+            colc.metric("Gross Profit", f"₹{gross_profit:,.2f}")
+            cold.metric("Expenses", f"₹{total_expenses:,.2f}")
+            cole.metric("Net Profit", f"₹{net_profit:,.2f}")
+
+            # Create a summary dataframe
+            pl_data = {
+                "Particulars": ["Sales", "Less: COGS (Purchases - Returns)", "Gross Profit", "Less: Expenses", "Net Profit"],
+                "Amount": [sales, cogs, gross_profit, total_expenses, net_profit]
+            }
+            df_pl = pd.DataFrame(pl_data)
+            st.dataframe(df_pl, use_container_width=True)
+
+            if st.button("Download PDF (P&L)"):
+                pdf_bytes = generate_pdf("Profit & Loss Statement", df_pl, ["Particulars", "Amount"])
+                b64 = base64.b64encode(pdf_bytes).decode()
+                href = f'<a href="data:application/octet-stream;base64,{b64}" download="profit_loss.pdf">Download PDF</a>'
+                st.markdown(href, unsafe_allow_html=True)
