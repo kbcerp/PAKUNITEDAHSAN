@@ -3,4 +3,3 @@ supabase>=2.0.0
 pandas>=2.0.0
 plotly>=5.17.0
 fpdf2>=2.7.0
-python-dotenv>=1.0.0
